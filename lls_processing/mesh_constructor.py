@@ -12,9 +12,6 @@ import open3d as o3d
 import numpy as np
 import copy 
 
-# Aggregating points will be slow. 
-# It may be preferable to first collect all the pcl messages and only convert it to a mesh afterwards
-# For the actual part, CAD data can be used to create a path beforehand
 
 # TODO
     # Try to get the offset from the flange to the LLS
@@ -47,6 +44,9 @@ class MeshConstructor(Node):
         # Each of these is a finished mesh compiled from all PCL data of a measurement interval
         self.alpha = 0.01
         self.meshes: list[o3d.geometry.TriangleMesh] = []
+
+        # TODO FIX VECTOR FLIP IN THE SCANCONTROL DRIVER AND REMOVE THIS LATER
+        self.flip_axes = True 
 
 
     def pcl_callback(self, msg):
@@ -83,6 +83,12 @@ class MeshConstructor(Node):
             tf_mat = self.tf_transform_to_matrix(tf_transform)
             
             loaded_array = np.frombuffer(pointcloud.data, dtype=np.float32).reshape(-1, 4)
+
+            # TODO quick fix - remove later
+            if self.flip_axes:
+                loaded_array[:,0] = - loaded_array[:,0]
+                loaded_array[:,2] = - loaded_array[:,2]
+
                         
             o3d_pcl = o3d.geometry.PointCloud()
             o3d_pcl.points = o3d.utility.Vector3dVector(loaded_array[:,:3])
@@ -90,7 +96,7 @@ class MeshConstructor(Node):
 
             o3d_combined_pcl += o3d_pcl
        
-        # Without the random downsample the voxel downsample times out 
+        # Voxel downsampling would be prefered but it is not working for some reason 
         o3d_combined_pcl = o3d_combined_pcl.remove_non_finite_points().random_down_sample(0.1)#.voxel_down_sample(voxel_size=0.1)
 
         # Add to the stored pcl_list
