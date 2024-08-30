@@ -12,7 +12,6 @@ import open3d as o3d
 import numpy as np
 import copy 
 from datetime import datetime
-import pathlib
 import os 
 
 
@@ -109,9 +108,10 @@ class MeshConstructor(Node):
         for pointcloud in self.transformed_pcls:
     
             with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
-                self.get_logger().info("Removing outliers and estimating normals")
-                pointcloud.remove_statistical_outlier(self, 100, 2)
+                self.get_logger().info("Estimating normals")
+                
                 pointcloud.estimate_normals()
+
                 pointcloud.orient_normals_consistent_tangent_plane(100)
                 # mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pointcloud, depth=9)
                 self.get_logger().info("Creating mesh")
