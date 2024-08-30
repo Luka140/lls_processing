@@ -11,15 +11,16 @@ from keyboard_msgs.msg import Key
 import open3d as o3d
 import numpy as np
 import copy 
+from datetime import datetime
+import pathlib
+import os 
 
-
-# TODO
-    # Try to get the offset from the flange to the LLS
-    
 
 class MeshConstructor(Node):
     def __init__(self):
         super().__init__('mesh_constructor')
+
+        # TODO parameterize later 
 
         pcl_topic = 'scancontrol_pointcloud'
         self.create_subscription(PointCloud2, pcl_topic, self.pcl_callback, 1)
@@ -27,7 +28,6 @@ class MeshConstructor(Node):
         # self.create_subscription(JointState, 'joint_states', self.update_position, 1)
         self.keyboard_listener  = self.create_subscription(Key, 'keydown', self.key_callback, 1)
 
-        
         # Track coordinate transformations
         self.tf_buffer = Buffer(cache_time=rclpy.time.Time(seconds=3))
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -42,12 +42,10 @@ class MeshConstructor(Node):
 
         # A collection of meshes to be compared
         # Each of these is a finished mesh compiled from all PCL data of a measurement interval
-        self.alpha = 0.01
+        self.alpha = 0.001
         self.meshes: list[o3d.geometry.TriangleMesh] = []
-
-        # TODO FIX VECTOR FLIP IN THE SCANCONTROL DRIVER AND REMOVE THIS LATER
-        self.flip_axes = True 
-
+        self.mesh_folder_path = os.path.join(os.getcwd(), 'meshes')
+        self.mesh_filename = 'test1'
 
     def pcl_callback(self, msg):
         
@@ -83,12 +81,6 @@ class MeshConstructor(Node):
             tf_mat = self.tf_transform_to_matrix(tf_transform)
             
             loaded_array = np.frombuffer(pointcloud.data, dtype=np.float32).reshape(-1, 4)
-
-            # TODO quick fix - remove later
-            if self.flip_axes:
-                loaded_array[:,0] = - loaded_array[:,0]
-                loaded_array[:,2] = - loaded_array[:,2]
-
                         
             o3d_pcl = o3d.geometry.PointCloud()
             o3d_pcl.points = o3d.utility.Vector3dVector(loaded_array[:,:3])
@@ -96,8 +88,7 @@ class MeshConstructor(Node):
 
             o3d_combined_pcl += o3d_pcl
        
-        # Voxel downsampling would be prefered but it is not working for some reason 
-        o3d_combined_pcl = o3d_combined_pcl.remove_non_finite_points().random_down_sample(0.1)#.voxel_down_sample(voxel_size=0.1)
+        o3d_combined_pcl = o3d_combined_pcl.remove_non_finite_points()
 
         # Add to the stored pcl_list
         self.transformed_pcls.append(o3d_combined_pcl)
@@ -105,18 +96,36 @@ class MeshConstructor(Node):
         # Publish combined cloud for debugging
         self.combined_pcl_publisher.publish(self.create_pcl_msg(o3d_combined_pcl))
         
-        # o3d.visualization.draw_geometries([o3d_combined_pcl], width=800, height=600)
-
-        self.get_logger().info(f"Published combined pointcloud containing {len(o3d_combined_pcl.points)}")
+        self.get_logger().info(f"Published combined pointcloud containing {len(o3d_combined_pcl.points)} points")
         return 
         
     def construct_mesh(self) -> None:
         # Construct a mesh of the transformed pointcloud 
-
+        if len(self.transformed_pcls) < 1:
+            self.get_logger().info("There are no pointclouds stored to create a mesh")
+            return 
+        
         self.get_logger().info("Constructing a triangle mesh")
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.create_from_cloud_alpha_shape(pcd=self.transformed_pcl, alpha=self.alpha)
-        self.meshes.append(mesh)
+        for pointcloud in self.transformed_pcls:
+    
+            with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
+                self.get_logger().info("Removing outliers and estimating normals")
+                pointcloud.remove_statistical_outlier(self, 100, 2)
+                pointcloud.estimate_normals()
+                pointcloud.orient_normals_consistent_tangent_plane(100)
+                # mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pointcloud, depth=9)
+                self.get_logger().info("Creating mesh")
+                mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pointcloud, alpha=self.alpha)
+            self.meshes.append(mesh)
+
+            # self.get_logger().info(f'The storage path exists: {os.path.isdir(self.mesh_folder_path)}')
+            path = os.path.join(self.mesh_folder_path, f'mesh_{self.mesh_filename}_{str(datetime.now()).split(".")[0]}.ply')
+            write_success = o3d.io.write_triangle_mesh(path, mesh)
+
+        if write_success:
+            self.get_logger().info(f'Meshes created and stored in {self.mesh_folder_path}')
+        else:
+            self.get_logger().info('Failed to write meshes to file')
         return 
 
     def tf_transform_to_matrix(self, tf_trans) -> np.ndarray:
@@ -128,17 +137,17 @@ class MeshConstructor(Node):
         # Some packages use one, other use the other and they often don't specify which is used.  
         transform[:3,:3] = _get_mat_from_quat(np.array([rot.w, rot.x, rot.y, rot.z]))
         transform[:3,3] = [trans.x, trans.y, trans.z]
-        
         return transform
     
     def key_callback(self, Key):
         if Key.code == Key.KEY_C:
             self.combine_pointclouds()
+        if Key.code == Key.KEY_M:
+            self.construct_mesh()
 
     def create_pcl_msg(self, o3d_pcl):
 
         datapoints = np.asarray(o3d_pcl.points, dtype=np.float32)
-
 
         pointcloud = PointCloud2()
         pointcloud.header.frame_id = self.global_frame_id
@@ -154,9 +163,7 @@ class MeshConstructor(Node):
         pointcloud.height = 1
         pointcloud.width = total_points
 
-        # self.is_bigendian = False
         pointcloud.data = datapoints.flatten().tobytes()
-
         return pointcloud
 
 
@@ -165,7 +172,7 @@ def _get_mat_from_quat(quaternion: np.ndarray) -> np.ndarray:
     ===========================================================================================================
     TAKEN FROM THE ROS2 REPO: 
     https://github.com/ros2/geometry2/blob/rolling/tf2_geometry_msgs/src/tf2_geometry_msgs/tf2_geometry_msgs.py
-    simply importing it led to issues because it is not in the setup file. 
+    simply importing it led to issues because it is not in the setup file in humble. 
     ===========================================================================================================
 
     Convert a quaternion to a rotation matrix.
