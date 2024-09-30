@@ -7,6 +7,7 @@ from tf2_ros.buffer import Buffer
 
 from sensor_msgs.msg import PointCloud2, PointField
 from keyboard_msgs.msg import Key
+from std_msgs.msg import Empty
 
 import open3d as o3d
 import numpy as np
@@ -22,13 +23,15 @@ class MeshConstructor(Node):
         # TODO parameterize later 
 
         pcl_topic = 'scancontrol_pointcloud'
-        self.create_subscription(PointCloud2, pcl_topic, self.pcl_callback, 1)
+        self.create_subscription(PointCloud2, pcl_topic, self.pcl_callback, 10)
         self.combined_pcl_publisher = self.create_publisher(PointCloud2, 'combined_cloud', 1)
         # self.create_subscription(JointState, 'joint_states', self.update_position, 1)
         self.keyboard_listener  = self.create_subscription(Key, 'keydown', self.key_callback, 1)
 
+        self.combine_trigger    = self.create_subscription(Empty, 'combine_pointclouds', self.combine_pointclouds, 1)
+
         # Track coordinate transformations
-        self.tf_buffer = Buffer(cache_time=rclpy.time.Time(seconds=3))
+        self.tf_buffer = Buffer(cache_time=rclpy.time.Time(seconds=10))
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.global_frame_id = 'base_link'
 
@@ -39,12 +42,18 @@ class MeshConstructor(Node):
         # The PCLs that have been set to a common coordinate system and combined
         self.transformed_pcls: list[o3d.geometry.PointCloud] = [] 
 
+        # Create bounding box to crop the point clouds to 
+        crop_cloud = o3d.geometry.PointCloud()
+        crop_cloud.points = o3d.utility.Vector3dVector(np.array([[-3, -3, -3],
+                                                                 [3, 3, 3]]))
+        self.crop_volume = crop_cloud.get_axis_aligned_bounding_box()
+        
         # A collection of meshes to be compared
         # Each of these is a finished mesh compiled from all PCL data of a measurement interval
-        self.alpha = 0.001
+        self.alpha = 0.005
         self.meshes: list[o3d.geometry.TriangleMesh] = []
         self.mesh_folder_path = os.path.join(os.getcwd(), 'meshes')
-        self.mesh_filename = 'test1'
+        self.mesh_filename = 'turbine_blade'
 
     def pcl_callback(self, msg):
         
@@ -62,9 +71,9 @@ class MeshConstructor(Node):
 
         self.scanned_data.append((msg, tf_trans))
 
-    def combine_pointclouds(self) -> None:
+    def combine_pointclouds(self, _) -> None:
         # Take all points in scanned data and combine them into a single coordinate frame
-    
+
         # Make a new list to prevent it being extended while in the loop
         current_data = copy.deepcopy(self.scanned_data)
         
@@ -79,20 +88,35 @@ class MeshConstructor(Node):
             # Create a transformation matrix from the transformation message obtained from tf_trans
             tf_mat = self.tf_transform_to_matrix(tf_transform)
             
-            loaded_array = np.frombuffer(pointcloud.data, dtype=np.float32).reshape(-1, 4)
-                        
+            loaded_array = np.frombuffer(pointcloud.data, dtype=np.float32).reshape(-1, 4) 
+            if not np.any(loaded_array > 0):
+                continue 
+            if not np.any(np.isfinite(loaded_array)):
+                continue
+            
+            loaded_array = loaded_array[np.where(loaded_array[:,2] > 1e-3)]
+
             o3d_pcl = o3d.geometry.PointCloud()
             o3d_pcl.points = o3d.utility.Vector3dVector(loaded_array[:,:3])
             o3d_pcl.transform(tf_mat)
 
             o3d_combined_pcl += o3d_pcl
        
+        self.get_logger().info("Removing non finite points...")
         o3d_combined_pcl = o3d_combined_pcl.remove_non_finite_points()
+        o3d_combined_pcl = o3d_combined_pcl.crop(self.crop_volume)
+
+        pcl_path = os.path.join(self.mesh_folder_path, f'pointcloud_{self.mesh_filename}_{str(datetime.now()).split(".")[0]}.ply')
+        self.get_logger().info(f"Saving pointcloud to: {pcl_path}")
+
+        o3d.io.write_point_cloud(pcl_path, o3d_combined_pcl)
+        self.get_logger().info("Saved pointcloud")
 
         # Add to the stored pcl_list
         self.transformed_pcls.append(o3d_combined_pcl)
 
         # Publish combined cloud for debugging
+        # downsampled_pcl = o3d_combined_pcl.random_down_sample(0.3)
         self.combined_pcl_publisher.publish(self.create_pcl_msg(o3d_combined_pcl))
         
         self.get_logger().info(f"Published combined pointcloud containing {len(o3d_combined_pcl.points)} points")
@@ -106,13 +130,16 @@ class MeshConstructor(Node):
         
         self.get_logger().info("Constructing a triangle mesh")
         for pointcloud in self.transformed_pcls:
-    
+            pcl_path = os.path.join(self.mesh_folder_path, f'pointcloud_{self.mesh_filename}_{str(datetime.now()).split(".")[0]}.ply')
+            o3d.io.write_point_cloud(pcl_path, pointcloud)
+            self.get_logger().info("Saved pointcloud")
             with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
                 self.get_logger().info("Estimating normals")
-                
+                pointcloud = pointcloud.voxel_down_sample(0.01)
                 pointcloud.estimate_normals()
 
-                pointcloud.orient_normals_consistent_tangent_plane(100)
+                # self.get_logger().info("Setting normal orientation")
+                # pointcloud.orient_normals_consistent_tangent_plane(100)
                 # mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pointcloud, depth=9)
                 self.get_logger().info("Creating mesh")
                 mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pointcloud, alpha=self.alpha)
@@ -141,7 +168,7 @@ class MeshConstructor(Node):
     
     def key_callback(self, Key):
         if Key.code == Key.KEY_C:
-            self.combine_pointclouds()
+            self.combine_pointclouds(Empty())
         if Key.code == Key.KEY_M:
             self.construct_mesh()
 
@@ -159,7 +186,7 @@ class MeshConstructor(Node):
         pointcloud.fields = fields
         pointcloud.point_step = len(fields) * bytes_per_point
         total_points = datapoints.shape[0]
-        pointcloud.is_dense = True
+        pointcloud.is_dense = False
         pointcloud.height = 1
         pointcloud.width = total_points
 
