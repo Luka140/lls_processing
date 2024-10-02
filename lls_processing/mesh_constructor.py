@@ -9,6 +9,7 @@ from sensor_msgs.msg import PointCloud2, PointField
 from keyboard_msgs.msg import Key
 from std_msgs.msg import Empty
 
+
 import open3d as o3d
 import numpy as np
 import copy 
@@ -53,6 +54,8 @@ class MeshConstructor(Node):
         self.alpha = 0.005
         self.meshes: list[o3d.geometry.TriangleMesh] = []
         self.mesh_folder_path = os.path.join(os.getcwd(), 'meshes')
+        if not os.path.exists(self.mesh_folder_path):
+            os.mkdir(self.mesh_folder_path)
         self.mesh_filename = 'turbine_blade'
 
     def pcl_callback(self, msg):
