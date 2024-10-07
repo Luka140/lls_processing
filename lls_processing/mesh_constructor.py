@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
 from tf2_ros import TransformListener, LookupException, ExtrapolationException
 from tf2_ros.buffer import Buffer
@@ -8,6 +9,8 @@ from tf2_ros.buffer import Buffer
 from sensor_msgs.msg import PointCloud2, PointField
 from keyboard_msgs.msg import Key
 from std_msgs.msg import Empty
+from std_srvs.srv import Trigger
+from data_gathering_msgs.srv import RequestPCL
 
 import open3d as o3d
 import numpy as np
@@ -28,7 +31,9 @@ class MeshConstructor(Node):
         # self.create_subscription(JointState, 'joint_states', self.update_position, 1)
         self.keyboard_listener  = self.create_subscription(Key, 'keydown', self.key_callback, 1)
 
-        self.combine_trigger    = self.create_subscription(Empty, 'combine_pointclouds', self.combine_pointclouds, 1)
+        # Replaced by service but here for backwards compatibility
+        self.combine_trigger_msg = self.create_subscription(Empty, 'combine_pointclouds', self.combine_pointclouds_msg, 1)
+        self.combine_trigger     = self.create_service(RequestPCL, 'combine_pointclouds', self.combine_pointclouds_srv, callback_group=MutuallyExclusiveCallbackGroup())
 
         # Track coordinate transformations
         self.tf_buffer = Buffer(cache_time=rclpy.time.Time(seconds=10))
@@ -44,8 +49,8 @@ class MeshConstructor(Node):
 
         # Create bounding box to crop the point clouds to 
         crop_cloud = o3d.geometry.PointCloud()
-        crop_cloud.points = o3d.utility.Vector3dVector(np.array([[-3, -3, -3],
-                                                                 [3, 3, 3]]))
+        crop_cloud.points = o3d.utility.Vector3dVector(np.array([[-1, -1, -1],
+                                                                 [1, 1, 1]]))
         self.crop_volume = crop_cloud.get_axis_aligned_bounding_box()
         
         # A collection of meshes to be compared
@@ -71,7 +76,16 @@ class MeshConstructor(Node):
 
         self.scanned_data.append((msg, tf_trans))
 
-    def combine_pointclouds(self, _) -> None:
+    def combine_pointclouds_msg(self, _):
+        self.combine()
+
+    def combine_pointclouds_srv(self, request, response):
+        pcl = self.combine()
+        response.success = True 
+        response.pointcloud = pcl
+        return response
+
+    def combine(self) -> None:
         # Take all points in scanned data and combine them into a single coordinate frame
 
         # Make a new list to prevent it being extended while in the loop
@@ -88,13 +102,15 @@ class MeshConstructor(Node):
             # Create a transformation matrix from the transformation message obtained from tf_trans
             tf_mat = self.tf_transform_to_matrix(tf_transform)
             
+            # TODO check Nick:
+                # frombuffer making twice the required data where all even rows are nonsense
             loaded_array = np.frombuffer(pointcloud.data, dtype=np.float32).reshape(-1, 4) 
             if not np.any(loaded_array > 0):
                 continue 
             if not np.any(np.isfinite(loaded_array)):
                 continue
             
-            loaded_array = loaded_array[np.where(loaded_array[:,2] > 1e-3)]
+            loaded_array = loaded_array[np.where(loaded_array[:,2] > 5e-3)]
 
             o3d_pcl = o3d.geometry.PointCloud()
             o3d_pcl.points = o3d.utility.Vector3dVector(loaded_array[:,:3])
@@ -117,10 +133,11 @@ class MeshConstructor(Node):
 
         # Publish combined cloud for debugging
         # downsampled_pcl = o3d_combined_pcl.random_down_sample(0.3)
-        self.combined_pcl_publisher.publish(self.create_pcl_msg(o3d_combined_pcl))
+        pcl_msg = self.create_pcl_msg(o3d_combined_pcl)
+        self.combined_pcl_publisher.publish(pcl_msg)
         
         self.get_logger().info(f"Published combined pointcloud containing {len(o3d_combined_pcl.points)} points")
-        return 
+        return pcl_msg
         
     def construct_mesh(self) -> None:
         # Construct a mesh of the transformed pointcloud 
