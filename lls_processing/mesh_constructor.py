@@ -12,6 +12,7 @@ from std_msgs.msg import Empty
 from std_srvs.srv import Trigger
 from data_gathering_msgs.srv import RequestPCL
 
+
 import open3d as o3d
 import numpy as np
 import copy 
@@ -58,6 +59,8 @@ class MeshConstructor(Node):
         self.alpha = 0.005
         self.meshes: list[o3d.geometry.TriangleMesh] = []
         self.mesh_folder_path = os.path.join(os.getcwd(), 'meshes')
+        if not os.path.exists(self.mesh_folder_path):
+            os.mkdir(self.mesh_folder_path)
         self.mesh_filename = 'turbine_blade'
 
     def pcl_callback(self, msg):
