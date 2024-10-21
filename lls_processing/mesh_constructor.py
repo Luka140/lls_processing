@@ -29,22 +29,26 @@ class MeshConstructor(Node):
         self.declare_parameter('alpha', 0.005)
         self.declare_parameter('bbox_max', 0.0)
         self.declare_parameter('local_bbox_max', 0.0)
-        self.declare_parameter('save_mesh', True)
+        self.declare_parameter('save_pcl', True)
+        self.declare_parameter('publish_pcl', True)
+        self.declare_parameter('listen_keyboard', True)
 
         # Get parameters
-        self.global_frame_id = self.get_parameter('global_frame_id').get_parameter_value().string_value
-        self.alpha = self.get_parameter('alpha').get_parameter_value().double_value
-        self.bbox_max = self.get_parameter('bbox_max').get_parameter_value().double_value
-        self.local_bbox_max = self.get_parameter('local_bbox_max').get_parameter_value().double_value
-        self.save_mesh = self.get_parameter('save_mesh').get_parameter_value().bool_value
+        self.global_frame_id    = self.get_parameter('global_frame_id').get_parameter_value().string_value
+        self.alpha              = self.get_parameter('alpha').get_parameter_value().double_value
+        self.bbox_max           = self.get_parameter('bbox_max').get_parameter_value().double_value
+        self.local_bbox_max     = self.get_parameter('local_bbox_max').get_parameter_value().double_value
+        self.save_pcl           = self.get_parameter('save_pcl').get_parameter_value().bool_value
+        self.publish_pcl        = self.get_parameter('publish_pcl').get_parameter_value().bool_value
+        self.listen_keyboard    = self.get_parameter('listen_keyboard').get_parameter_value().bool_value
 
         # PCL topic and subscribers
-        pcl_topic = 'scancontrol_pointcloud'
-        self.create_subscription(PointCloud2, pcl_topic, self.pcl_callback, 20)
+        self.create_subscription(PointCloud2, 'scancontrol_pointcloud', self.pcl_callback, 20)
         self.combined_pcl_publisher = self.create_publisher(PointCloud2, 'combined_cloud', 1)
-        self.keyboard_listener = self.create_subscription(Key, 'keydown', self.key_callback, 1)
+        if self.listen_keyboard:
+            self.keyboard_listener = self.create_subscription(Key, 'keydown', self.key_callback, 1)
 
-        # Replaced by service but here for backwards compatibility
+        # Topic replaced by service but here for backwards compatibility
         self.combine_trigger_msg = self.create_subscription(Empty, 'combine_pointclouds', self.combine_pointclouds_msg, 1)
         self.combine_trigger = self.create_service(RequestPCL, 'combine_pointclouds', self.combine_pointclouds_srv, callback_group=MutuallyExclusiveCallbackGroup())
 
@@ -69,14 +73,6 @@ class MeshConstructor(Node):
                                                                     [self.local_bbox_max, self.local_bbox_max, self.local_bbox_max]]))
             self.local_crop_volume = local_crop_cloud.get_axis_aligned_bounding_box()
 
-        # Mesh-related parameters
-        self.meshes: list[o3d.geometry.TriangleMesh] = []
-
-        if self.save_mesh:
-            self.mesh_folder_path = os.path.join(os.getcwd(), 'meshes')
-            if not os.path.exists(self.mesh_folder_path):
-                os.mkdir(self.mesh_folder_path)
-            self.mesh_filename = 'turbine_blade'
     
     def pcl_callback(self, msg):
         
@@ -95,15 +91,16 @@ class MeshConstructor(Node):
         self.scanned_data.append((msg, tf_trans))
 
     def combine_pointclouds_msg(self, _):
-        self.combine()
+        # Set publish to true regardless of setting in launch file
+        self.combine(publish_override=True)
 
     def combine_pointclouds_srv(self, request, response):
         pcl = self.combine()
-        response.success = True 
+        response.succiness = True 
         response.pointcloud = pcl
         return response
 
-    def combine(self) -> None:
+    def combine(self, publish_override=False) -> None:
         # Take all points in scanned data and combine them into a single coordinate frame
 
         # Make a new list to prevent it being extended while in the loop
@@ -148,7 +145,7 @@ class MeshConstructor(Node):
         if self.bbox_max > 0.0:
             o3d_combined_pcl = o3d_combined_pcl.crop(self.crop_volume)
 
-        if self.save_mesh:
+        if self.save_pcl:
             pcl_path = os.path.join(self.mesh_folder_path, f'pointcloud_{self.mesh_filename}_{str(datetime.now()).split(".")[0]}.ply')
             self.get_logger().info(f"Saving pointcloud to: {pcl_path}")
 
@@ -161,45 +158,14 @@ class MeshConstructor(Node):
         # Publish combined cloud for debugging
         # downsampled_pcl = o3d_combined_pcl.random_down_sample(0.3)
         pcl_msg = self.create_pcl_msg(o3d_combined_pcl)
-        self.combined_pcl_publisher.publish(pcl_msg)
+
+        if self.publish_pcl or publish_override:
+            self.combined_pcl_publisher.publish(pcl_msg)
         
         self.get_logger().info(f"Published combined pointcloud containing {len(o3d_combined_pcl.points)} points")
         return pcl_msg
         
-    def construct_mesh(self) -> None:
-        # TODO this is currently not used 
-        # Construct a mesh of the transformed pointcloud 
-        if len(self.transformed_pcls) < 1:
-            self.get_logger().info("There are no pointclouds stored to create a mesh")
-            return 
-        
-        self.get_logger().info("Constructing a triangle mesh")
-        for pointcloud in self.transformed_pcls:
-            pcl_path = os.path.join(self.mesh_folder_path, f'pointcloud_{self.mesh_filename}_{str(datetime.now()).split(".")[0]}.ply')
-            o3d.io.write_point_cloud(pcl_path, pointcloud)
-            self.get_logger().info("Saved pointcloud")
-            with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
-                self.get_logger().info("Estimating normals")
-                pointcloud = pointcloud.voxel_down_sample(0.01)
-                pointcloud.estimate_normals()
-
-                # self.get_logger().info("Setting normal orientation")
-                # pointcloud.orient_normals_consistent_tangent_plane(100)
-                # mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pointcloud, depth=9)
-                self.get_logger().info("Creating mesh")
-                mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pointcloud, alpha=self.alpha)
-            self.meshes.append(mesh)
-
-            # self.get_logger().info(f'The storage path exists: {os.path.isdir(self.mesh_folder_path)}')
-            path = os.path.join(self.mesh_folder_path, f'mesh_{self.mesh_filename}_{str(datetime.now()).split(".")[0]}.ply')
-            write_success = o3d.io.write_triangle_mesh(path, mesh)
-
-        if write_success:
-            self.get_logger().info(f'Meshes created and stored in {self.mesh_folder_path}')
-        else:
-            self.get_logger().info('Failed to write meshes to file')
-        return 
-
+ 
     def tf_transform_to_matrix(self, tf_trans) -> np.ndarray:
         transform = np.eye(4)
         rot = tf_trans.transform.rotation
@@ -218,7 +184,6 @@ class MeshConstructor(Node):
             self.construct_mesh()
 
     def create_pcl_msg(self, o3d_pcl):
-
         datapoints = np.asarray(o3d_pcl.points, dtype=np.float32)
 
         pointcloud = PointCloud2()

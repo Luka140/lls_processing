@@ -39,7 +39,7 @@ def generate_launch_description():
             {'alpha': LaunchConfiguration('alpha')},
             {'bbox_max': LaunchConfiguration('bbox_max')},
             {'local_bbox_max': LaunchConfiguration('local_bbox_max')},
-            {'save_mesh': LaunchConfiguration('save_mesh')}
+            {'save_pcl': LaunchConfiguration('save_mesh')}
         ]
     )
 
