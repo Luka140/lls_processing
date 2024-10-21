@@ -24,45 +24,60 @@ class MeshConstructor(Node):
     def __init__(self):
         super().__init__('mesh_constructor')
 
-        # TODO parameterize later 
+        # Declare parameters
+        self.declare_parameter('global_frame_id', 'base_link')
+        self.declare_parameter('alpha', 0.005)
+        self.declare_parameter('bbox_max', 0.0)
+        self.declare_parameter('local_bbox_max', 0.0)
+        self.declare_parameter('save_mesh', True)
 
+        # Get parameters
+        self.global_frame_id = self.get_parameter('global_frame_id').get_parameter_value().string_value
+        self.alpha = self.get_parameter('alpha').get_parameter_value().double_value
+        self.bbox_max = self.get_parameter('bbox_max').get_parameter_value().double_value
+        self.local_bbox_max = self.get_parameter('local_bbox_max').get_parameter_value().double_value
+        self.save_mesh = self.get_parameter('save_mesh').get_parameter_value().bool_value
+
+        # PCL topic and subscribers
         pcl_topic = 'scancontrol_pointcloud'
-        self.create_subscription(PointCloud2, pcl_topic, self.pcl_callback, 10)
+        self.create_subscription(PointCloud2, pcl_topic, self.pcl_callback, 20)
         self.combined_pcl_publisher = self.create_publisher(PointCloud2, 'combined_cloud', 1)
-        # self.create_subscription(JointState, 'joint_states', self.update_position, 1)
-        self.keyboard_listener  = self.create_subscription(Key, 'keydown', self.key_callback, 1)
+        self.keyboard_listener = self.create_subscription(Key, 'keydown', self.key_callback, 1)
 
         # Replaced by service but here for backwards compatibility
         self.combine_trigger_msg = self.create_subscription(Empty, 'combine_pointclouds', self.combine_pointclouds_msg, 1)
-        self.combine_trigger     = self.create_service(RequestPCL, 'combine_pointclouds', self.combine_pointclouds_srv, callback_group=MutuallyExclusiveCallbackGroup())
+        self.combine_trigger = self.create_service(RequestPCL, 'combine_pointclouds', self.combine_pointclouds_srv, callback_group=MutuallyExclusiveCallbackGroup())
 
-        # Track coordinate transformations
+        # TF buffer for transformations
         self.tf_buffer = Buffer(cache_time=rclpy.time.Time(seconds=10))
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.global_frame_id = 'base_link'
 
-        # Collect scanned pointclouds in format: [(PointCloud2, self.current_pose)]
-        # This should be emptied once the points have been sent to transformed_pcls
+        # Initialize scanned data and transformed point clouds
         self.scanned_data = []
-        
-        # The PCLs that have been set to a common coordinate system and combined
-        self.transformed_pcls: list[o3d.geometry.PointCloud] = [] 
+        self.transformed_pcls: list[o3d.geometry.PointCloud] = []
 
-        # Create bounding box to crop the point clouds to 
-        crop_cloud = o3d.geometry.PointCloud()
-        crop_cloud.points = o3d.utility.Vector3dVector(np.array([[-1, -1, -1],
-                                                                 [1, 1, 1]]))
-        self.crop_volume = crop_cloud.get_axis_aligned_bounding_box()
-        
-        # A collection of meshes to be compared
-        # Each of these is a finished mesh compiled from all PCL data of a measurement interval
-        self.alpha = 0.005
+        # Create a bounding box based on the bbox_max parameter
+        if self.bbox_max > 0.0:
+            crop_cloud = o3d.geometry.PointCloud()
+            crop_cloud.points = o3d.utility.Vector3dVector(np.array([[-self.bbox_max, -self.bbox_max, -self.bbox_max],
+                                                                    [self.bbox_max, self.bbox_max, self.bbox_max]]))
+            self.crop_volume = crop_cloud.get_axis_aligned_bounding_box()
+
+        if self.local_bbox_max > 0.0:
+            local_crop_cloud = o3d.geometry.PointCloud()
+            local_crop_cloud.points = o3d.utility.Vector3dVector(np.array([[-self.local_bbox_max, -self.local_bbox_max, -self.local_bbox_max],
+                                                                    [self.local_bbox_max, self.local_bbox_max, self.local_bbox_max]]))
+            self.local_crop_volume = local_crop_cloud.get_axis_aligned_bounding_box()
+
+        # Mesh-related parameters
         self.meshes: list[o3d.geometry.TriangleMesh] = []
-        self.mesh_folder_path = os.path.join(os.getcwd(), 'meshes')
-        if not os.path.exists(self.mesh_folder_path):
-            os.mkdir(self.mesh_folder_path)
-        self.mesh_filename = 'turbine_blade'
 
+        if self.save_mesh:
+            self.mesh_folder_path = os.path.join(os.getcwd(), 'meshes')
+            if not os.path.exists(self.mesh_folder_path):
+                os.mkdir(self.mesh_folder_path)
+            self.mesh_filename = 'turbine_blade'
+    
     def pcl_callback(self, msg):
         
         # If the PCL message is empty 
@@ -105,31 +120,40 @@ class MeshConstructor(Node):
             # Create a transformation matrix from the transformation message obtained from tf_trans
             tf_mat = self.tf_transform_to_matrix(tf_transform)
             
-            # TODO check Nick:
-                # frombuffer making twice the required data where all even rows are nonsense
-            loaded_array = np.frombuffer(pointcloud.data, dtype=np.float32).reshape(-1, 4) 
+            loaded_array = np.frombuffer(pointcloud.data, dtype=np.float32).reshape(-1, len(pointcloud.fields)) 
             if not np.any(loaded_array > 0):
                 continue 
             if not np.any(np.isfinite(loaded_array)):
                 continue
             
-            loaded_array = loaded_array[np.where(loaded_array[:,2] > 5e-3)]
+            # The scancontrol driver creates pointclouds that are 32 bytes per point, only the first 12 of which are used for XYZ. 
+            # It also has an intensity field which currently doesn't have the real data. 
+            # The empty data creates nonsense points on every second row from the last 16 empty bytes being interpreted as a point.
+            # Bytes 12-16 are currently interpreted as intensity (it isn't) in the fourth column but this isnt used so no problem. 
+            if pointcloud.header.frame_id == 'scancontrol':
+                loaded_array = loaded_array[0::2, :] 
+
+            # loaded_array = loaded_array[np.where(loaded_array[:,2] > 5e-3)] 
 
             o3d_pcl = o3d.geometry.PointCloud()
             o3d_pcl.points = o3d.utility.Vector3dVector(loaded_array[:,:3])
+            if self.local_bbox_max > 0.0:
+                o3d_pcl = o3d_pcl.crop(self.local_crop_volume)
             o3d_pcl.transform(tf_mat)
 
             o3d_combined_pcl += o3d_pcl
        
         self.get_logger().info("Removing non finite points...")
-        o3d_combined_pcl = o3d_combined_pcl.remove_non_finite_points()
-        o3d_combined_pcl = o3d_combined_pcl.crop(self.crop_volume)
+        o3d_combined_pcl = o3d_combined_pcl.remove_non_finite_points() 
+        if self.bbox_max > 0.0:
+            o3d_combined_pcl = o3d_combined_pcl.crop(self.crop_volume)
 
-        pcl_path = os.path.join(self.mesh_folder_path, f'pointcloud_{self.mesh_filename}_{str(datetime.now()).split(".")[0]}.ply')
-        self.get_logger().info(f"Saving pointcloud to: {pcl_path}")
+        if self.save_mesh:
+            pcl_path = os.path.join(self.mesh_folder_path, f'pointcloud_{self.mesh_filename}_{str(datetime.now()).split(".")[0]}.ply')
+            self.get_logger().info(f"Saving pointcloud to: {pcl_path}")
 
-        o3d.io.write_point_cloud(pcl_path, o3d_combined_pcl)
-        self.get_logger().info("Saved pointcloud")
+            o3d.io.write_point_cloud(pcl_path, o3d_combined_pcl)
+            self.get_logger().info("Saved pointcloud")
 
         # Add to the stored pcl_list
         self.transformed_pcls.append(o3d_combined_pcl)
@@ -143,6 +167,7 @@ class MeshConstructor(Node):
         return pcl_msg
         
     def construct_mesh(self) -> None:
+        # TODO this is currently not used 
         # Construct a mesh of the transformed pointcloud 
         if len(self.transformed_pcls) < 1:
             self.get_logger().info("There are no pointclouds stored to create a mesh")
@@ -252,10 +277,17 @@ def main(args=None):
 
     mesh_constructor = MeshConstructor()
     executor = MultiThreadedExecutor()
-
-    rclpy.spin(mesh_constructor, executor=executor)
+    try:
+        rclpy.spin(mesh_constructor, executor=executor)
+    except KeyboardInterrupt:
+        pass 
     mesh_constructor.destroy_node()
-    rclpy.shutdown()
+
+    # Avoid stack trace 
+    try:
+        rclpy.shutdown()
+    except rclpy._rclpy_pybind11.RCLError:
+        pass 
 
 
 if __name__ == '__main__':
