@@ -96,7 +96,7 @@ class MeshConstructor(Node):
 
     def combine_pointclouds_srv(self, request, response):
         pcl = self.combine()
-        response.succiness = True 
+        response.success = True 
         response.pointcloud = pcl
         return response
 
