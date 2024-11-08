@@ -7,11 +7,9 @@ from tf2_ros import TransformListener, LookupException, ExtrapolationException
 from tf2_ros.buffer import Buffer
 
 from sensor_msgs.msg import PointCloud2, PointField
-from keyboard_msgs.msg import Key
 from std_msgs.msg import Empty
 from std_srvs.srv import Trigger
 from data_gathering_msgs.srv import RequestPCL
-
 
 import open3d as o3d
 import numpy as np
@@ -20,9 +18,9 @@ from datetime import datetime
 import os 
 
 
-class MeshConstructor(Node):
+class PCLConstructor(Node):
     def __init__(self):
-        super().__init__('mesh_constructor')
+        super().__init__('pcl_constructor')
 
         # Declare parameters
         self.declare_parameter('global_frame_id', 'base_link')
@@ -46,11 +44,12 @@ class MeshConstructor(Node):
         self.create_subscription(PointCloud2, 'scancontrol_pointcloud', self.pcl_callback, 20)
         self.combined_pcl_publisher = self.create_publisher(PointCloud2, 'combined_cloud', 1)
         if self.listen_keyboard:
+            from keyboard_msgs.msg import Key
             self.keyboard_listener = self.create_subscription(Key, 'keydown', self.key_callback, 1)
 
         # Topic replaced by service but here for backwards compatibility
         self.combine_trigger_msg = self.create_subscription(Empty, 'combine_pointclouds', self.combine_pointclouds_msg, 1)
-        self.combine_trigger = self.create_service(RequestPCL, 'combine_pointclouds', self.combine_pointclouds_srv, callback_group=MutuallyExclusiveCallbackGroup())
+        self.combine_trigger = self.create_service(RequestPCL, '~/combine_pointclouds', self.combine_pointclouds_srv, callback_group=MutuallyExclusiveCallbackGroup())
 
         # TF buffer for transformations
         self.tf_buffer = Buffer(cache_time=rclpy.time.Time(seconds=10))
@@ -240,7 +239,7 @@ def _get_mat_from_quat(quaternion: np.ndarray) -> np.ndarray:
 def main(args=None):
     rclpy.init(args=args)
 
-    mesh_constructor = MeshConstructor()
+    mesh_constructor = PCLConstructor()
     executor = MultiThreadedExecutor()
     try:
         rclpy.spin(mesh_constructor, executor=executor)
